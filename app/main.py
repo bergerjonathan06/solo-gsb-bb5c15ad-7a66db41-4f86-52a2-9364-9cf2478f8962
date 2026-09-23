@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, coverage, gate, mutation, profile, refgraph, replay, sarif
+from app import compat, compare, coverage, gate, mutation, profile, redact, refgraph, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -23,6 +23,8 @@ from app.schemas import (
     ProfileCreate,
     ProfileListResponse,
     ProfileResponse,
+    RedactRequest,
+    RedactResponse,
     ReferenceDiagnosticsRequest,
     ReferenceDiagnosticsResponse,
     ReplayRequest,
@@ -250,6 +252,32 @@ def mutation_coverage(
         if payload.max_per_rule is not None
         else None,
     )
+    return {"analysis_id": analysis_id, **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/redact",
+    response_model=RedactResponse,
+    tags=["analyses"],
+    summary="敏感字段脱敏：按新 schema 的 x-sensitive 标记替换文档值",
+)
+def redact_analysis(analysis_id: int, payload: RedactRequest,
+                    db: Session = Depends(get_db)):
+    # 纯只读：只用已保存的新 schema 对提交文档做脱敏，绝不修改分析记录、
+    # 提交原文与库中样本
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    invalid_refs = redact.find_invalid_refs(row.new_schema)
+    if invalid_refs:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "新 schema 含无法解析的 $ref，无法执行脱敏",
+                "invalid_refs": invalid_refs,
+            },
+        )
+    result = redact.redact_documents(row.new_schema, payload.documents)
     return {"analysis_id": analysis_id, **result}
 
 

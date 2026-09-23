@@ -1258,3 +1258,146 @@ def test_reference_diagnostics_is_readonly(client):
     assert resp.status_code == 200
     after = client.get("/api/analyses").json()["total"]
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/redact
+# ---------------------------------------------------------------------------
+
+REDACT_NEW = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "password": {"type": "string", "x-sensitive": True},
+        "tags": {"type": "array", "items": {"x-sensitive": True}},
+        "payment": {
+            "oneOf": [
+                {"required": ["card"],
+                 "properties": {"card": {"x-sensitive": True}}},
+                {"required": ["paypal"],
+                 "properties": {"paypal": {"x-sensitive": True}}},
+            ]
+        },
+        "child": {"$ref": "#/$defs/Node"},
+    },
+    "$defs": {
+        "Node": {
+            "type": "object",
+            "properties": {
+                "secret": {"x-sensitive": True},
+                "child": {"$ref": "#/$defs/Node"},
+            },
+        }
+    },
+}
+
+
+def _redact_analysis(client):
+    return _create(client, {"type": "object"}, REDACT_NEW, "redact-case")
+
+
+def test_redact_masks_sensitive_values(client):
+    analysis = _redact_analysis(client)
+    documents = [
+        {"name": "a", "password": "p1", "payment": {"card": "4111"}},
+        {"name": "b", "payment": {"paypal": "x@y.z"}, "tags": ["t1", "t2"]},
+        {"name": "c"},
+        {"child": {"secret": "s", "child": {"secret": "deep"}}},
+    ]
+    resp = client.post(f"/api/analyses/{analysis['id']}/redact",
+                       json={"documents": documents})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["analysis_id"] == analysis["id"]
+    assert data["total_documents"] == 4
+    assert data["redacted_documents"] == 3
+    # 输入顺序保持
+    assert [d["index"] for d in data["documents"]] == [0, 1, 2, 3]
+
+    d0 = data["documents"][0]
+    assert d0["document"] == {
+        "name": "a", "password": "***", "payment": {"card": "***"},
+    }
+    assert d0["redacted_paths"] == ["#/password", "#/payment/card"]
+
+    d1 = data["documents"][1]
+    assert d1["document"] == {
+        "name": "b", "payment": {"paypal": "***"}, "tags": ["***", "***"],
+    }
+    assert d1["redacted_paths"] == [
+        "#/payment/paypal", "#/tags/0", "#/tags/1",
+    ]
+
+    # 无敏感字段命中：原文返回、无替换指针
+    d2 = data["documents"][2]
+    assert d2["document"] == {"name": "c"}
+    assert d2["redacted_paths"] == []
+
+    # 递归 $ref：逐层脱敏并在实例耗尽时终止
+    d3 = data["documents"][3]
+    assert d3["document"] == {
+        "child": {"secret": "***", "child": {"secret": "***"}}
+    }
+    assert d3["redacted_paths"] == ["#/child/child/secret", "#/child/secret"]
+    assert data["total_replacements"] == (
+        len(d0["redacted_paths"]) + len(d1["redacted_paths"])
+        + len(d3["redacted_paths"])
+    )
+
+
+def test_redact_is_readonly_and_keeps_samples(client):
+    analysis = _create(
+        client, {"type": "object"}, REDACT_NEW, "redact-readonly",
+    )
+    # 直接改库中样本不经过接口：创建时带 samples，验证脱敏后样本不变
+    with_samples = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": REDACT_NEW,
+        "samples": [{"password": "stored-sample"}],
+    })
+    assert with_samples.status_code == 201, with_samples.text
+    target = with_samples.json()
+
+    resp = client.post(f"/api/analyses/{target['id']}/redact",
+                       json={"documents": [{"password": "p"}]})
+    assert resp.status_code == 200
+
+    after = client.get(f"/api/analyses/{target['id']}").json()
+    assert after["report"] == target["report"]
+    assert after["new_schema"] == target["new_schema"]
+    assert after["samples"] == [{"password": "stored-sample"}]
+    # 分析总数不因脱敏调用变化（不产生任何持久化记录）
+    assert client.get("/api/analyses").json()["total"] >= 2
+
+
+def test_redact_unresolvable_ref_returns_422_with_schema_pointer(client):
+    new_schema = {
+        "type": "object",
+        "properties": {
+            "x": {"$ref": "#/$defs/Missing"},
+            "y": {"$ref": "https://example.com/s.json#/$defs/Y"},
+        },
+    }
+    analysis = _create(client, {"type": "object"}, new_schema)
+    resp = client.post(f"/api/analyses/{analysis['id']}/redact",
+                       json={"documents": [{"x": 1}]})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    by_source = {item["source"]: item for item in detail["invalid_refs"]}
+    assert by_source["#/properties/x"]["reason"] == "target_not_found"
+    assert by_source["#/properties/y"]["reason"] == "external_reference"
+
+
+def test_redact_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/redact",
+                       json={"documents": [{"a": 1}]})
+    assert resp.status_code == 404
+
+
+def test_redact_validation_errors(client):
+    analysis = _redact_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/redact"
+    # 缺少 documents 字段 -> 422
+    assert client.post(base, json={}).status_code == 422
+    # 空文档列表 -> 422
+    assert client.post(base, json={"documents": []}).status_code == 422

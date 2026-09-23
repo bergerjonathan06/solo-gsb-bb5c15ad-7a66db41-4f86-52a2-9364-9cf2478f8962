@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.coverage import MAX_COVERAGE_DOCUMENTS
 from app.mutation import MAX_MUTATION_DOCUMENTS, MAX_RULE_LIMIT, RULE_NAMES
 from app.profile import MAX_PROFILE_DOCUMENTS
+from app.redact import MAX_REDACT_DOCUMENTS
 from app.replay import MAX_REPLAY_DOCUMENTS
 
 
@@ -692,3 +693,45 @@ class ReferenceDiagnosticsResponse(BaseModel):
         ..., description="从根侧不可达的 $defs 节点（按指针排序）"
     )
     cycles: list[ReferenceCycle] = Field(..., description="引用循环链（按链上指针排序）")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/redact 敏感字段脱敏（只读，不落库）
+# ---------------------------------------------------------------------------
+
+
+class RedactRequest(BaseModel):
+    """POST /api/analyses/{id}/redact 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_REDACT_DOCUMENTS,
+        description=(
+            f"待脱敏的 JSON 文档列表（任意 JSON 类型），数量 1..{MAX_REDACT_DOCUMENTS}"
+        ),
+    )
+
+
+class RedactedDocument(BaseModel):
+    """单篇文档的脱敏结果。"""
+
+    index: int = Field(..., ge=0, description="文档在提交列表中的下标（从 0 开始）")
+    document: Any = Field(
+        ..., description='脱敏后的文档（x-sensitive 标记的实例值已替换为 "***"）'
+    )
+    redacted_paths: list[str] = Field(
+        ..., description="被替换位置的实例指针（JSON Pointer，根为 #，升序）"
+    )
+
+
+class RedactResponse(BaseModel):
+    """敏感字段脱敏结果（接口只读，不持久化、不修改原文与库中样本）。"""
+
+    analysis_id: int
+    total_documents: int = Field(..., ge=0)
+    redacted_documents: int = Field(..., ge=0, description="至少有一处替换的文档数")
+    total_replacements: int = Field(..., ge=0, description="全部文档的替换位置总数")
+    documents: list[RedactedDocument] = Field(
+        ..., description="逐文档脱敏结果，顺序与提交顺序一致"
+    )

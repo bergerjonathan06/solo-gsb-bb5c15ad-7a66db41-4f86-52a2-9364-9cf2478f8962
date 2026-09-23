@@ -17,9 +17,10 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、$ref 引用依赖诊断
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、敏感字段脱敏、$ref 引用依赖诊断
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── refgraph.py      # 单份 schema 的 $ref 引用依赖诊断（引用边 / 不可达 $defs / 循环链 / 无效目标，只读不落库）
+│   ├── redact.py        # 敏感字段脱敏引擎（x-sensitive 标记 + 实例引导遍历 + 文档内 $ref 解析 + 递归引用终止，只读不落库）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
 │   ├── coverage.py      # 回放样本最小覆盖（确定性贪心集合覆盖，复用回放校验与归因选择最少代表文档）
@@ -37,6 +38,7 @@
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
 │   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
+│   ├── test_redact.py   # 敏感字段脱敏引擎单元测试（属性 / 数组遍历 / $ref 递归终止 / 分支选择 / 只读性）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -1165,6 +1167,127 @@ curl -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
 
 入参为空列表、超过 5000 个文档、缺少 `documents` 字段、`max_per_rule`
 含未知规则名或负数（超过 10000）时返回 `422`。
+
+### `POST /api/analyses/{id}/redact` — 敏感字段脱敏
+
+用分析记录保存的**新 schema**（`new_schema`）对一批 JSON 文档（最多
+**5000** 个，任意 JSON 类型）执行脱敏：把 schema 节点上标注
+**`x-sensitive: true`** 的实例值整体替换为 `"***"`，并报告每一处替换
+位置的实例指针。接口为**纯只读**操作：不修改分析报告、不改动提交的
+原文档与库中样本、不追加画像快照；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段        | 类型    | 必填 | 说明                                          |
+| ----------- | ------- | ---- | --------------------------------------------- |
+| `documents` | any[]   | 是   | 待脱敏的 JSON 文档列表（任意类型），数量 1..5000 |
+
+**遍历与替换规则**：
+
+- 仅把 `x-sensitive: true`（布尔字面量）对应节点的实例值替换为 `"***"`
+  并停止下钻（子树被整体遮蔽）；未命中的属性 / 元素原样保留；
+- 遍历对象属性（`properties`，按实例实际存在的属性下钻）与数组元素
+  （`prefixItems`、字典形式 `items`、draft-04/06/07 元组形式 `items`）；
+- 解析文档内部 `$ref`（`#` 与 `#/...` 本地指针，RFC 6901）；节点含
+  `$ref` 时按 draft-07 语义跳到目标节点（兄弟关键字不再生效）；
+  **同一实例位置遇递归引用时停止重复展开**（按 `(引用目标, 实例位置)`
+  去重），A↔B 互引、自引 `#` 等循环 schema 上必然终止；
+- `allOf` 遍历全部分支；`oneOf` / `anyOf` **只遍历对当前实例校验通过
+  的分支**（分支判定基于未被遮蔽的原始值，分支内的 `#/...` 引用仍解析
+  到原始 schema）；
+- 若祖先位置已被整体遮蔽，经其他分支（如 `allOf`）到达的更深层位置不
+  再重复记录，最终替换位置不存在祖先 / 后代重叠。
+
+**无法解析的 `$ref`**（外部引用、锚点名称片段、目标不存在、非法指针
+转义、非字符串取值）返回 `422`，`detail.invalid_refs` 逐条给出声明该
+引用的 **schema 指针**（`source`）、引用原文与原因代码：
+
+```json
+{
+  "detail": {
+    "message": "新 schema 含无法解析的 $ref，无法执行脱敏",
+    "invalid_refs": [
+      { "source": "#/properties/x", "ref": "#/$defs/Missing",
+        "reason": "target_not_found",
+        "message": "引用目标 #/$defs/Missing 在路径段 'Missing' 处不存在" }
+    ]
+  }
+}
+```
+
+完整示例（服务地址 `http://localhost:8000`，见
+[快速开始](#快速开始docker-compose推荐)）：
+
+```bash
+# 1) 创建分析（新 schema 用 x-sensitive 标注敏感字段）
+ID=$(curl -s -X POST http://localhost:8000/api/analyses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "old_schema": {"type": "object"},
+    "new_schema": {
+      "type": "object",
+      "properties": {
+        "name":     {"type": "string"},
+        "password": {"type": "string", "x-sensitive": true},
+        "payment": {
+          "oneOf": [
+            {"required": ["card"],
+             "properties": {"card": {"x-sensitive": true}}},
+            {"required": ["paypal"],
+             "properties": {"paypal": {"x-sensitive": true}}}
+          ]
+        }
+      }
+    }
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+
+# 2) 对一批文档执行脱敏
+curl -s -X POST "http://localhost:8000/api/analyses/$ID/redact" \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"name": "alice", "password": "s3cret", "payment": {"card": "4111"}},
+    {"name": "bob", "payment": {"other": 1}}
+  ]}' | python3 -m json.tool
+```
+
+响应：
+
+```json
+{
+  "analysis_id": 1,
+  "total_documents": 2,
+  "redacted_documents": 1,
+  "total_replacements": 2,
+  "documents": [
+    {
+      "index": 0,
+      "document": {
+        "name": "alice",
+        "password": "***",
+        "payment": { "card": "***" }
+      },
+      "redacted_paths": ["#/password", "#/payment/card"]
+    },
+    {
+      "index": 1,
+      "document": { "name": "bob", "payment": { "other": 1 } },
+      "redacted_paths": []
+    }
+  ]
+}
+```
+
+响应字段：
+
+| 字段                              | 说明                                                   |
+| --------------------------------- | ------------------------------------------------------ |
+| `documents[]`                     | 逐文档脱敏结果，**顺序与提交顺序一致**                 |
+| `documents[].document`            | 脱敏后的文档（敏感值已替换为 `"***"`，其余原样保留）   |
+| `documents[].redacted_paths`      | 被替换位置的实例指针（JSON Pointer，根为 `#`，升序）   |
+| `redacted_documents`              | 至少有一处替换的文档数                                 |
+| `total_replacements`              | 全部文档的替换位置总数                                 |
+
+入参为空列表、超过 5000 个文档或缺少 `documents` 字段时返回 `422`。
 
 ### `POST /api/reference-diagnostics` — `$ref` 引用依赖诊断
 
