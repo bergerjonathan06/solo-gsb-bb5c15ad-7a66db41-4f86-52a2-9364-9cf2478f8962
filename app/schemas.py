@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.coverage import MAX_COVERAGE_DOCUMENTS
 from app.mutation import MAX_MUTATION_DOCUMENTS, MAX_RULE_LIMIT, RULE_NAMES
 from app.profile import MAX_PROFILE_DOCUMENTS
+from app.redact import MAX_REDACT_DOCUMENTS
 from app.replay import MAX_REPLAY_DOCUMENTS
 
 
@@ -598,6 +599,55 @@ class MutationCoverageResponse(BaseModel):
     )
     uncovered_paths: list[str] = Field(
         ..., description="未被样本覆盖的变异路径（存活变异体的 schema 指针，可能重复）"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/redact 基于 x-sensitive 的实例脱敏
+# ---------------------------------------------------------------------------
+
+
+class RedactRequest(BaseModel):
+    """POST /api/analyses/{id}/redact 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_REDACT_DOCUMENTS,
+        description=(
+            f"待脱敏的 JSON 文档列表（任意 JSON 类型），数量 1..{MAX_REDACT_DOCUMENTS}"
+        ),
+    )
+
+
+class RedactedReplacement(BaseModel):
+    """一处脱敏替换：实例指针 + 触发替换的 schema 节点指针。"""
+
+    instance_pointer: str = Field(
+        ..., description="被替换实例值的位置（JSON Pointer，根为 #）"
+    )
+    schema_pointer: str = Field(
+        ..., description="声明 x-sensitive: true 的 schema 节点位置（JSON Pointer，根为 #）"
+    )
+
+
+class RedactedDocument(BaseModel):
+    """单篇文档的脱敏结果。"""
+
+    index: int = Field(..., ge=0, description="文档在提交列表中的下标（从 0 开始）")
+    redacted: Any = Field(..., description="脱敏后的文档（入参文档的深拷贝，仅命中位置被替换为 ***）")
+    replacements: list[RedactedReplacement] = Field(
+        ..., description="替换位置列表（实例指针确定排序，同一实例位置最多一条）"
+    )
+
+
+class RedactResponse(BaseModel):
+    """实例脱敏结果（接口只读，不持久化、不改动原文与库中样本）。"""
+
+    analysis_id: int
+    total_documents: int = Field(..., ge=0)
+    results: list[RedactedDocument] = Field(
+        ..., description="按提交顺序返回的逐文档脱敏结果"
     )
 
 

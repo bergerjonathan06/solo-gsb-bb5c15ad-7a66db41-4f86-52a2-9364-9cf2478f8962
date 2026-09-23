@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, coverage, gate, mutation, profile, refgraph, replay, sarif
+from app import compat, compare, coverage, gate, mutation, profile, redact, refgraph, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -23,6 +23,8 @@ from app.schemas import (
     ProfileCreate,
     ProfileListResponse,
     ProfileResponse,
+    RedactRequest,
+    RedactResponse,
     ReferenceDiagnosticsRequest,
     ReferenceDiagnosticsResponse,
     ReplayRequest,
@@ -251,6 +253,40 @@ def mutation_coverage(
         else None,
     )
     return {"analysis_id": analysis_id, **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/redact",
+    response_model=RedactResponse,
+    tags=["analyses"],
+    summary="按新 schema 的 x-sensitive 标记脱敏文档实例值",
+    responses={
+        422: {"description": "请求体不合法，或 schema 中存在无法解析的 $ref"},
+    },
+)
+def redact_analysis_documents(
+    analysis_id: int, payload: RedactRequest, db: Session = Depends(get_db)
+):
+    # 纯只读：只基于已保存的新 schema 脱敏提交文档的深拷贝，
+    # 绝不修改原文、分析记录或库中样本
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    try:
+        result = redact.redact_documents(row.new_schema, payload.documents)
+    except redact.UnresolvableReference as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": f"无法解析的 $ref: {exc.message}",
+                "ref": exc.ref,
+                "reason": exc.reason,
+                "schema_pointer": exc.schema_pointer,
+                "instance_pointer": exc.instance_pointer,
+            },
+        )
+    return {"analysis_id": analysis_id,
+            "total_documents": len(payload.documents), **result}
 
 
 @app.get(

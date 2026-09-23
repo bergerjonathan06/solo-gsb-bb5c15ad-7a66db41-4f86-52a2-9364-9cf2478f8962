@@ -17,13 +17,14 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、$ref 引用依赖诊断
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估、x-sensitive 实例脱敏、$ref 引用依赖诊断
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── refgraph.py      # 单份 schema 的 $ref 引用依赖诊断（引用边 / 不可达 $defs / 循环链 / 无效目标，只读不落库）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
 │   ├── coverage.py      # 回放样本最小覆盖（确定性贪心集合覆盖，复用回放校验与归因选择最少代表文档）
 │   ├── mutation.py      # 样本变异覆盖评估（新 schema 单点变异确定性生成 + 逐变异校验 + 分类 mutation score）
+│   ├── redact.py        # 基于新 schema x-sensitive 标记的实例脱敏（对象/数组并行遍历 + #/... 本地 $ref + oneOf/anyOf/allOf + 递归引用终止）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -37,6 +38,7 @@
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
 │   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
+│   ├── test_redact.py   # 实例脱敏引擎单元测试（对象/数组遍历 / $ref / oneOf/anyOf/allOf / 递归终止 / 不可解析引用）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -141,6 +143,37 @@ curl -s -X POST "http://localhost:8000/api/analyses/$ID/mutation-coverage" \
     {"status": "pending", "age": 0},
     {"status": "active", "age": 100},
     {"status": "active"}
+  ]}' | python3 -m json.tool
+```
+
+也可以一键体验**敏感字段脱敏**：新 schema 中把字段标记
+`"x-sensitive": true`，提交文档后只有这些位置被替换为 `"***"`
+（访问地址 `http://localhost:8000/api/analyses/<ID>/redact`）：
+
+```bash
+# 1) 创建带 x-sensitive 标记的分析
+RID=$(curl -s -X POST http://localhost:8000/api/analyses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "old_schema": {"type": "object"},
+    "new_schema": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "ssn":  {"type": "string", "x-sensitive": true},
+        "cards": {"type": "array", "items": {
+          "type": "object",
+          "properties": {"number": {"x-sensitive": true}}
+        }}
+      }
+    }
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+
+# 2) 脱敏：ssn 与 cards[].number 被替换为 ***，name 保持原样
+curl -s -X POST "http://localhost:8000/api/analyses/$RID/redact" \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"name": "alice", "ssn": "111-22-3333", "cards": [{"number": "4111..."}]}
   ]}' | python3 -m json.tool
 ```
 
@@ -1165,6 +1198,141 @@ curl -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
 
 入参为空列表、超过 5000 个文档、缺少 `documents` 字段、`max_per_rule`
 含未知规则名或负数（超过 10000）时返回 `422`。
+
+### `POST /api/analyses/{id}/redact` — 按 `x-sensitive` 标记脱敏文档实例
+
+读取该分析的**新 Schema**（`new_schema`），对一批提交的 JSON 文档做
+schema 与实例的并行遍历：**仅当**实例位置对应的 schema 节点显式声明
+`"x-sensitive": true` 时，把该实例值替换为固定掩码 `"***"`，其余内容
+原样保留。接口为**纯只读**操作：脱敏只作用于**提交文档的深拷贝**，
+不修改请求原文，也不改动库中保存的分析、旧/新 schema 或样本；分析
+编号不存在返回 `404`。
+
+- **对象 / 数组遍历**：`properties`、`patternProperties`、
+  `additionalProperties`、`items`（数组写法）、`prefixItems` 与
+  draft-04/06/07 元组写法 `items` + `additionalItems` 均按实例的实际
+  结构下钻；
+- **本地 `$ref`**：解析文档内 `#` / `#/...` JSON Pointer 片段引用
+  （RFC 6901，支持 `~0` / `~1` 与 `%2F` 转义），不访问网络或外部文件；
+- **组合关键字**：`oneOf` / `anyOf` **只遍历对当前实例（原值）校验
+  通过的分支**，`allOf` 遍历**全部分支**；分支判定基于尚未脱敏的
+  原始实例值，敏感字段自身被掩码不会改变分支路由；
+- **递归引用终止**：同一实例位置上同一引用目标只展开一次，`#` 自指、
+  定义互引、链表式自引用均安全终止；进入子属性 / 数组元素后重新计数，
+  因此数组每个元素都会按其元素 schema 正常脱敏；
+- **无法解析的引用**（外部引用、`#anchor` 名称片段、目标不存在、非法
+  指针转义、非字符串 `$ref`）返回 **`422`**，响应体带声明该引用的
+  **schema 指针**（`schema_pointer`）与当前实例指针。
+
+请求体：
+
+| 字段        | 类型  | 必填 | 说明                                            |
+| ----------- | ----- | ---- | ----------------------------------------------- |
+| `documents` | any[] | 是   | 待脱敏 JSON 文档列表（任意类型），数量 1..5000    |
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/redact \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {
+      "name": "alice",
+      "ssn": "111-22-3333",
+      "tags": ["vip"],
+      "profile": {"email": "alice@example.com"},
+      "record": {"kind": "a", "secret": "shh"}
+    },
+    {"name": "bob", "ssn": "444-55-6666", "record": {"kind": "b"}}
+  ]}'
+```
+
+上例对应新 schema（创建分析时提交的 `new_schema`）：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string"},
+    "ssn": {"type": "string", "x-sensitive": true},
+    "tags": {"type": "array", "items": {"x-sensitive": true}},
+    "profile": {"$ref": "#/$defs/Profile"},
+    "record": {
+      "oneOf": [
+        {"type": "object",
+         "properties": {"kind": {"const": "a"}, "secret": {"x-sensitive": true}},
+         "required": ["kind"]},
+        {"type": "object",
+         "properties": {"kind": {"const": "b"}},
+         "required": ["kind"]}
+      ]
+    }
+  },
+  "$defs": {
+    "Profile": {
+      "type": "object",
+      "properties": {"email": {"x-sensitive": true}}
+    }
+  }
+}
+```
+
+响应（按输入顺序返回脱敏文档与替换位置的实例指针）：
+
+```json
+{
+  "analysis_id": 1,
+  "total_documents": 2,
+  "results": [
+    {
+      "index": 0,
+      "redacted": {
+        "name": "alice",
+        "ssn": "***",
+        "tags": ["***"],
+        "profile": {"email": "***"},
+        "record": {"kind": "a", "secret": "***"}
+      },
+      "replacements": [
+        {"instance_pointer": "#/profile/email",
+         "schema_pointer": "#/$defs/Profile/properties/email"},
+        {"instance_pointer": "#/record/secret",
+         "schema_pointer": "#/properties/record/oneOf/0/properties/secret"},
+        {"instance_pointer": "#/ssn", "schema_pointer": "#/properties/ssn"},
+        {"instance_pointer": "#/tags/0", "schema_pointer": "#/properties/tags/items"}
+      ]
+    },
+    {
+      "index": 1,
+      "redacted": {"name": "bob", "ssn": "***", "record": {"kind": "b"}},
+      "replacements": [
+        {"instance_pointer": "#/ssn", "schema_pointer": "#/properties/ssn"}
+      ]
+    }
+  ]
+}
+```
+
+响应字段：
+
+| 字段                              | 说明                                                         |
+| --------------------------------- | ------------------------------------------------------------ |
+| `results[]`                       | 与提交顺序一一对应的逐文档结果（`index` 为从 0 开始的下标）    |
+| `results[].redacted`              | 脱敏后的文档（入参文档的深拷贝；仅命中位置被替换为 `***`）     |
+| `results[].replacements[]`        | 替换位置列表，按实例指针确定排序，同一实例位置最多一条         |
+| `replacements[].instance_pointer` | 被替换实例值的位置（JSON Pointer，根为 `#`，如 `#/tags/0`）    |
+| `replacements[].schema_pointer`   | 声明 `x-sensitive: true` 的 schema 节点位置（如 `#/$defs/Profile/properties/email`） |
+
+判定细则：
+
+- 只有字面布尔值 `true` 才触发脱敏（`"x-sensitive": false` / `"yes"` /
+  其他类型一律忽略）；祖先节点命中时整体掩码，不再重复记录其后代位置；
+- `oneOf` / `anyOf` 的多个分支同时校验通过时（如分支约束互不排斥），
+  这些分支都会遍历；`allOf` 的分支即使对实例校验失败也照常遍历
+  （`allOf` 是叠加约束而非候选路由）；
+- 对象键中含 `/`、`~` 时实例指针按 RFC 6901 转义（`a/b` → `#/a~1b`，
+  `m~n` → `#/m~0n`），指针可直接定位回原文档；
+- 入参为空列表、超过 5000 个文档或缺少 `documents` 字段时同样返回
+  `422`（Pydantic 校验错误）；该接口不产生任何持久化记录，重复调用
+  结果完全一致。
 
 ### `POST /api/reference-diagnostics` — `$ref` 引用依赖诊断
 

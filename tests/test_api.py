@@ -1159,6 +1159,170 @@ def test_mutation_coverage_missing_analysis_returns_404(client):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/redact 基于 x-sensitive 的实例脱敏
+# ---------------------------------------------------------------------------
+
+
+REDACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "ssn": {"type": "string", "x-sensitive": True},
+        "tags": {"type": "array", "items": {"x-sensitive": True}},
+        "profile": {"$ref": "#/$defs/Profile"},
+        "record": {
+            "oneOf": [
+                {"type": "object",
+                 "properties": {"kind": {"const": "a"}, "secret": {"x-sensitive": True}},
+                 "required": ["kind"]},
+                {"type": "object",
+                 "properties": {"kind": {"const": "b"}},
+                 "required": ["kind"]},
+            ],
+        },
+    },
+    "$defs": {
+        "Profile": {
+            "type": "object",
+            "properties": {
+                "email": {"x-sensitive": True},
+                "next": {"$ref": "#/$defs/Profile"},
+            },
+        },
+    },
+}
+
+
+@pytest.fixture
+def redact_analysis(client):
+    resp = client.post("/api/analyses", json={
+        "name": "redact-case",
+        "old_schema": {"type": "object"},
+        "new_schema": REDACT_SCHEMA,
+        "samples": [{"name": "sample", "ssn": "SAMPLE-SECRET"}],
+    })
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_redact_replaces_sensitive_values(client, redact_analysis):
+    payload = {"documents": [
+        {"name": "alice", "ssn": "111-22-3333",
+         "tags": ["vip", "beta"],
+         "profile": {"email": "a@x.com", "next": {"email": "b@x.com"}},
+         "record": {"kind": "a", "secret": "shh"}},
+        {"name": "bob", "ssn": "444", "record": {"kind": "b"}},
+    ]}
+    resp = client.post(f"/api/analyses/{redact_analysis['id']}/redact", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["analysis_id"] == redact_analysis["id"]
+    assert data["total_documents"] == 2
+    results = data["results"]
+    assert [r["index"] for r in results] == [0, 1]
+
+    assert results[0]["redacted"] == {
+        "name": "alice",
+        "ssn": "***",
+        "tags": ["***", "***"],
+        "profile": {"email": "***", "next": {"email": "***"}},
+        "record": {"kind": "a", "secret": "***"},
+    }
+    # 提交原文未被改动
+    assert payload["documents"][0]["ssn"] == "111-22-3333"
+    assert payload["documents"][0]["profile"]["email"] == "a@x.com"
+
+    pointers = [(r["instance_pointer"], r["schema_pointer"])
+                for r in results[0]["replacements"]]
+    assert ("#/ssn", "#/properties/ssn") in pointers
+    assert ("#/tags/0", "#/properties/tags/items") in pointers
+    assert ("#/profile/email", "#/$defs/Profile/properties/email") in pointers
+    assert ("#/profile/next/email", "#/$defs/Profile/properties/email") in pointers
+    assert ("#/record/secret",
+            "#/properties/record/oneOf/0/properties/secret") in pointers
+
+    # 第二篇：oneOf 分支 1 不敏感
+    assert results[1]["redacted"] == {"name": "bob", "ssn": "***",
+                                      "record": {"kind": "b"}}
+
+
+def test_redact_does_not_modify_stored_analysis_and_samples(client, redact_analysis):
+    before = client.get(f"/api/analyses/{redact_analysis['id']}").json()
+    resp = client.post(f"/api/analyses/{redact_analysis['id']}/redact",
+                       json={"documents": [{"ssn": "x"}]})
+    assert resp.status_code == 200
+    after = client.get(f"/api/analyses/{redact_analysis['id']}").json()
+    assert after["new_schema"] == before["new_schema"]
+    assert after["samples"] == before["samples"]
+    assert after["samples"][0]["ssn"] == "SAMPLE-SECRET"
+
+
+def test_redact_accepts_arbitrary_json_documents(client, redact_analysis):
+    resp = client.post(f"/api/analyses/{redact_analysis['id']}/redact",
+                       json={"documents": [None, 42, "x", [1, 2], True]})
+    assert resp.status_code == 200
+    assert [r["redacted"] for r in resp.json()["results"]] == [
+        None, 42, "x", [1, 2], True]
+
+
+def test_redact_validation_errors(client, redact_analysis):
+    base = f"/api/analyses/{redact_analysis['id']}/redact"
+    # 缺少 documents
+    assert client.post(base, json={}).status_code == 422
+    # 空文档列表
+    assert client.post(base, json={"documents": []}).status_code == 422
+
+
+def test_redact_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/redact", json={"documents": [{}]})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"
+
+
+def test_redact_unresolvable_ref_returns_422_with_schema_pointer(client):
+    resp = client.post("/api/analyses", json={
+        "name": "redact-bad-ref",
+        "old_schema": {"type": "object"},
+        "new_schema": {"properties": {"p": {"$ref": "#/$defs/Missing"}}},
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"p": 1}]})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["schema_pointer"] == "#/properties/p"
+    assert detail["instance_pointer"] == "#/p"
+    assert detail["reason"] == "target_not_found"
+    assert detail["ref"] == "#/$defs/Missing"
+
+
+def test_redact_external_ref_returns_422(client):
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"type": "object"},
+        "new_schema": {"properties": {"p": {"$ref": "https://e.com/s.json#/a"}}},
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"p": 1}]})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["reason"] == "external_reference"
+
+
+def test_redact_uses_new_schema_not_old(client):
+    # 敏感标记只在新 schema 上：脱敏按新 schema 生效
+    resp = client.post("/api/analyses", json={
+        "old_schema": {"properties": {"ssn": {"x-sensitive": True}}},
+        "new_schema": {"properties": {"ssn": {"type": "string"}}},
+    })
+    analysis_id = resp.json()["id"]
+    resp = client.post(f"/api/analyses/{analysis_id}/redact",
+                       json={"documents": [{"ssn": "123"}]})
+    assert resp.status_code == 200
+    # 新 schema 无 x-sensitive -> 不脱敏
+    assert resp.json()["results"][0]["redacted"] == {"ssn": "123"}
+
+
+# ---------------------------------------------------------------------------
 # POST /api/reference-diagnostics 引用依赖诊断（只读，不落库）
 # ---------------------------------------------------------------------------
 
